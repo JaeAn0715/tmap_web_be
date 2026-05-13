@@ -107,7 +107,7 @@ flowchart LR
 - `clusters` — 즐겨찾기 모음 CRUD, 포크, POI별 좋아요·공유 코멘트
 - `poi-personal-notes` — POI 단위 개인 코멘트
 - `ai` — `poi-review-summary`, `poi-photo` 등(Gemini 키는 서버만 보유)
-- `demo-baby-ai` — 데모·시드용(환경에 따라 가드)
+- `demo-baby-ai` — `POST /demo/baby-ai-summary-seed`(Bearer 필수, 로그인 사용자에만 시드 연결)
 
 상세 계약은 [docs/openapi.yaml](./docs/openapi.yaml)과 [docs/api-auth-rules.md](./docs/api-auth-rules.md)에서 확인하실 수 있습니다.
 
