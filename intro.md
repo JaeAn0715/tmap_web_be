@@ -2,6 +2,9 @@
 
 이 문서는 **제품 관점**에서 이 서비스가 무엇인지, **현재 사용자에게 어떤 가치를 주는지**, 그리고 **프론트엔드와 백엔드가 어떻게 맞물리는지**를 정리합니다. 포트폴리오용으로, PM이 스스로 프로토타입을 구현했을 때 **어떤 새로운 가치를 전달할 수 있는지**를 설명하는 것이 목적입니다.
 
+만약 PM으로서 서비스 기획 포트폴리오를 보시고자 한다면 아래 링크를 참조해 주세요:
+https://drive.google.com/file/d/1xf9Xizm7eRwnPGQuufYymuZXrYPnBhSe/view?usp=sharing 
+
 관련 저장소는 다음과 같습니다.
 
 - 프론트엔드: [JaeAn0715/tmap_web_fe](https://github.com/JaeAn0715/tmap_web_fe) — TMAP OpenAPI·Web SDK 기반 POI 검색·지도·즐겨찾기 모음 UI (Vite + React + TypeScript)입니다.
