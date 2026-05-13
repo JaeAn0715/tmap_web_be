@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tmap
+      POSTGRES_PASSWORD: tmap
+      POSTGRES_DB: tmap
+    ports:
+      - "5433:5432"
+    volumes:
+      - tmap_pg_data:/var/lib/postgresql/data
+
+volumes:
+  tmap_pg_data:

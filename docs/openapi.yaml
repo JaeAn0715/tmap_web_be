@@ -1,0 +1,193 @@
+openapi: 3.0.3
+info:
+  title: TMAP Web BE API (subset)
+  description: >
+    제품·요구사항 문서에서는 POI 묶음을 **즐겨찾기 모음**이라 부른다.
+    이 스펙의 URL·스키마 이름 `cluster(s)`·`Cluster*` 는 그와 동일한 리소스다.
+  version: "0.2"
+servers:
+  - url: http://127.0.0.1:3001
+    description: Local
+paths:
+  /clusters/{id}:
+    get:
+      summary: Get favorite collection (즐겨찾기 모음; public read)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ClusterPayload
+        "404": { description: Not found }
+  /me/clusters:
+    get:
+      summary: List my favorite collections (즐겨찾기 모음; owned + subscribed)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: "{ clusters: ClusterPayload[] }"
+        "401": { description: Unauthorized }
+  /clusters:
+    post:
+      summary: Create favorite collection (즐겨찾기 모음)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, mapCenter, mapZoom, pois]
+              properties:
+                name: { type: string }
+                mapCenter:
+                  type: object
+                  properties: { lat: { type: number }, lng: { type: number } }
+                mapZoom: { type: number }
+                pois: { type: array, items: { type: object } }
+                id: { type: string, description: optional client-proposed id }
+      responses:
+        "200": { description: ClusterPayload }
+        "401": { description: Unauthorized }
+  /clusters/{clusterId}/pois/{poiId}/notes:
+    post:
+      summary: Add shared note on favorite collection (즐겨찾기 모음)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: clusterId, in: path, required: true, schema: { type: string } }
+        - { name: poiId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClusterNoteWrite"
+      responses:
+        "200": { description: Full ClusterPayload }
+        "400": { description: Validation }
+        "401": { description: Unauthorized }
+  /clusters/{clusterId}/pois/{poiId}/notes/{noteId}:
+    patch:
+      summary: Edit note on favorite collection (author only)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClusterNotePatch"
+      responses:
+        "200": { description: Full ClusterPayload }
+        "403": { description: Not author }
+    delete:
+      summary: Delete note (author or favorite-collection owner)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Full ClusterPayload }
+  /me/poi-notes:
+    get:
+      summary: List current user's personal POI notes
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: poiId
+          in: query
+          schema: { type: string }
+          description: Filter by POI id
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: "{ notes: ClusterNote[] }"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notes:
+                    type: array
+                    items: { $ref: "#/components/schemas/ClusterNote" }
+        "401": { description: Unauthorized }
+    post:
+      summary: Create personal POI note
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [poiId]
+              allOf:
+                - properties:
+                    poiId: { type: string }
+                - $ref: "#/components/schemas/ClusterNoteWrite"
+      responses:
+        "200":
+          description: ClusterNote
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClusterNote" }
+        "400": { description: Validation }
+        "401": { description: Unauthorized }
+  /me/poi-notes/{noteId}:
+    patch:
+      summary: Edit personal POI note (owner only)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ClusterNotePatch" }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClusterNote" }
+        "404": { description: Not found }
+    delete:
+      summary: Delete personal POI note
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: No content }
+        "404": { description: Not found }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ClusterNote:
+      type: object
+      required: [id, userId, userName, text, ts]
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        userName: { type: string }
+        text: { type: string }
+        ts: { type: integer, format: int64 }
+        editedAt: { type: integer, format: int64 }
+        imageUrls:
+          type: array
+          items: { type: string }
+    ClusterNoteWrite:
+      type: object
+      properties:
+        text: { type: string }
+        imageUrls:
+          type: array
+          maxItems: 3
+          items: { type: string }
+      description: At least one of non-empty trimmed text or imageUrls required
+    ClusterNotePatch:
+      type: object
+      properties:
+        text: { type: string }
+        imageUrls:
+          type: array
+          maxItems: 3
+          items: { type: string }
+      description: At least one field required; omit imageUrls to keep existing

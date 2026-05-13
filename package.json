@@ -1,0 +1,41 @@
+{
+  "name": "tmap-web-be",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "dev:pglite": "USE_PGLITE=1 tsx watch src/index.ts",
+    "docker:up": "sh -c 'if ! command -v docker >/dev/null 2>&1; then echo \"[docker:up] docker 명령이 없습니다. Docker Desktop 설치 후 앱을 실행해 PATH에 docker가 잡히는지 확인하세요: https://www.docker.com/products/docker-desktop/\" >&2; exit 127; fi; docker compose up -d'",
+    "start": "node dist/index.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:push": "prisma db push",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.4.5",
+    "@fastify/cors": "^10.0.2",
+    "@prisma/client": "^6.3.1",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.2.1",
+    "google-auth-library": "^9.15.1",
+    "jsonwebtoken": "^9.0.2",
+    "nanoid": "^5.0.9",
+    "pglite-prisma-adapter": "^0.6.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.8",
+    "@types/node": "^22.13.1",
+    "prisma": "^6.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

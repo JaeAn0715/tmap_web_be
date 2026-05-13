@@ -1,0 +1,125 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String   @id @default(uuid())
+  googleSub   String   @unique
+  email       String?
+  name        String?
+  pictureUrl  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  ownedClusters Cluster[]             @relation("ClusterOwner")
+  memberships   ClusterMembership[]
+  likes         ClusterPoiLike[]
+  notes         ClusterNote[]
+  recents       RecentDestination[]
+  savedPlaces   UserSavedPlaces?
+  poiPersonalNotes PoiPersonalNote[]
+}
+
+model UserSavedPlaces {
+  userId    String  @id
+  homeJson  Json?
+  workJson  Json?
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/** 즐겨찾기 모음: 여러 POI 묶음(제품명). 테이블명 `Cluster`는 API·프론트 호환을 유지. */
+model Cluster {
+  id        String   @id
+  name      String
+  ownerId   String
+  mapCenter Json
+  mapZoom   Float
+  pois      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner         User                  @relation("ClusterOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  memberships   ClusterMembership[]
+  likes         ClusterPoiLike[]
+  notes         ClusterNote[]
+}
+
+model ClusterMembership {
+  id        String   @id @default(uuid())
+  userId    String
+  clusterId String
+  hidden    Boolean  @default(false)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cluster Cluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clusterId])
+  @@index([userId, hidden])
+}
+
+model ClusterPoiLike {
+  id        String   @id @default(uuid())
+  clusterId String
+  poiId     String
+  userId    String
+  userName  String
+  createdAt DateTime @default(now())
+
+  cluster Cluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([clusterId, poiId, userId])
+  @@index([clusterId, poiId])
+}
+
+model ClusterNote {
+  id         String    @id @default(uuid())
+  clusterId  String
+  poiId      String
+  userId     String
+  userName   String
+  text       String
+  imageUrls  Json?
+  createdAt  DateTime  @default(now())
+  editedAt   DateTime?
+
+  cluster Cluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([clusterId, poiId])
+}
+
+/** Per-user, per-POI comments (not cluster-shared). Same JSON shape as cluster notes in API (`ClusterNote`). */
+model PoiPersonalNote {
+  id        String    @id @default(uuid())
+  userId    String
+  poiId     String
+  userName  String
+  text      String
+  imageUrls Json?
+  createdAt DateTime  @default(now())
+  editedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, poiId])
+  @@index([userId, createdAt])
+}
+
+model RecentDestination {
+  id      String   @id @default(uuid())
+  userId  String
+  poiId   String
+  poiJson Json
+  ts      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, poiId])
+  @@index([userId, ts])
+}
