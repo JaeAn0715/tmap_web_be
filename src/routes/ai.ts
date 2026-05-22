@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { requireUser } from "../plugins/auth.js";
 import { poiSchema } from "../schemas/poi.js";
-import { fetchPoiPhotoServer, geminiPoiReviewSummaryServer } from "../lib/gemini-server.js";
+import { geminiPoiReviewSummaryServer } from "../lib/gemini-server.js";
 import { loadGlobalUserReviewCorpus } from "../services/user-interest-corpus.js";
 
 const bodyPoi = z.object({ poi: poiSchema });
@@ -55,24 +55,14 @@ export const aiRoutes: FastifyPluginAsync<AiRoutesOptions> = async (app, opts) =
     }
   });
 
+  /** POI 사진은 Gemini 검색을 쓰지 않음 — 클라이언트는 emoji 플레이스홀더만 사용. */
   app.post("/ai/poi-photo", async (request, reply) => {
-    if (!guard(reply)) return;
     const user = requireUser(request, reply);
     if (!user) return;
     const parsed = bodyPoi.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Invalid body", details: parsed.error.flatten() });
     }
-    try {
-      const url = await fetchPoiPhotoServer(
-        parsed.data.poi,
-        opts.geminiApiKey,
-        opts.geminiModel,
-      );
-      return { url };
-    } catch (e) {
-      request.log.error(e);
-      return { url: null };
-    }
+    return { url: null };
   });
 };

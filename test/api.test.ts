@@ -274,6 +274,18 @@ describe("API", () => {
     expect(recent.statusCode).toBe(200);
   });
 
+  it("poi-photo returns null immediately without Gemini", async () => {
+    const token = await authAs("poi-photo-user");
+    const res = await app.inject({
+      method: "POST",
+      url: "/ai/poi-photo",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { poi: samplePoi("photo1") },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ url: null });
+  });
+
   it("cluster notes: text-only POST, image+placeholder text, empty rejected, PATCH keeps images", async () => {
     const token = await authAs("note-img-user");
     const create = await app.inject({
