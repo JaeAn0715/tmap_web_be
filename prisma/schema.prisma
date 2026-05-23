@@ -23,6 +23,8 @@ model User {
   recents       RecentDestination[]
   savedPlaces   UserSavedPlaces?
   poiPersonalNotes PoiPersonalNote[]
+  /** Top interest nouns from reviews: [{ term, count }] max 10, sorted by count desc */
+  interestNouns Json @default("[]")
 }
 
 model UserSavedPlaces {

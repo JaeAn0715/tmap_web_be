@@ -2,11 +2,35 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { requireUser } from "../plugins/auth.js";
+import {
+  rebuildUserInterestNounsFromCorpus,
+  type InterestNounEntry,
+} from "../services/user-interest-nouns.js";
 
 /** Stable id so share link `#/c/babyAiDemo012345678901234567890` matches docs. */
 export const DEMO_BABY_AI_CLUSTER_ID = "babyAiDemo012345678901234567890";
 
+/** AI 데모 시드당 생성하는 리뷰(노트) 최대 건수. */
+export const DEMO_BABY_AI_NOTE_LIMIT = 10;
+
+/** 시드 리뷰·POI 메타에 넣지 않을 금지어(명사 추출·요약 노이즈 방지). */
+const FORBIDDEN_DEMO_REVIEW_WORDS = /데모|맛집/u;
+
 const DEFAULT_TOPICS = ["유아의자", "유모차", "이유식"] as const;
+
+/** 실제 장소명처럼 보이는 샘플 이름(「데모」「맛집」 미사용). */
+const DEMO_POI_NAME_POOL = [
+  "청계한상",
+  "종로골목식당",
+  "마포온누리식당",
+  "연남브런치하우스",
+  "성수동밥상",
+  "을지로국밥",
+  "광화문뜰식당",
+  "한남동테이블",
+  "이태원정식",
+  "용산역앞식당",
+] as const;
 
 const postBodySchema = z.object({
   /** If set, only this Google-linked email may run the seed (extra guard). */
@@ -32,6 +56,8 @@ export type DemoBabyAiSeedResponse = {
     category: string;
   };
   sampleUserComments: string[];
+  /** 시드 직후 전체 리뷰 코퍼스 기준으로 재계산한 관심 명사(최대 10). */
+  interestNouns: InterestNounEntry[];
 };
 
 type PoiLite = {
@@ -51,12 +77,23 @@ function stableHash(s: string): number {
   return Math.abs(h);
 }
 
+function containsForbiddenDemoWords(text: string): boolean {
+  return FORBIDDEN_DEMO_REVIEW_WORDS.test(text);
+}
+
 function fillTpl(tpl: string, p: PoiLite): string {
   const shortAddr = p.address.length > 14 ? `${p.address.slice(0, 14)}…` : p.address;
   return tpl
     .replaceAll("{name}", p.name)
     .replaceAll("{cat}", p.category)
     .replaceAll("{addr}", shortAddr);
+}
+
+/** 시드용 POI·리뷰 문장에 금지어가 없는지 검사. */
+function isValidDemoReviewText(text: string): boolean {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length < 8) return false;
+  return !containsForbiddenDemoWords(t);
 }
 
 /** 토픽별 1~2문장 템플릿. 같은 POI에서 해시로 골라 겹치지 않게 쓴다. */
@@ -166,12 +203,18 @@ function pickUniqueNoteText(
   for (let attempt = 0; attempt < pool.length * 2; attempt++) {
     const idx = (h + attempt) % pool.length;
     const text = fillTpl(pool[idx]!, p).replace(/\s+/g, " ").trim();
-    if (text.length >= 8 && !usedOnThisPoi.has(text)) {
+    if (isValidDemoReviewText(text) && !usedOnThisPoi.has(text)) {
       usedOnThisPoi.add(text);
       return text;
     }
   }
-  const fallback = fillTpl(`${topic} 관점에서 본 {name} 방문 소감입니다. (${p.id.slice(-6)})`, p);
+  const fallback = fillTpl(
+    `${topic} 동반 방문 기준으로 통로·좌석·직원 응대가 무난했고 재방문을 검토해 볼 만하다.`,
+    p,
+  );
+  if (!isValidDemoReviewText(fallback)) {
+    throw new Error("Demo review template produced forbidden words");
+  }
   usedOnThisPoi.add(fallback);
   return fallback;
 }
@@ -182,10 +225,11 @@ function buildDemoPois(count: number): PoiLite[] {
   const pois: PoiLite[] = [];
   for (let i = 0; i < count; i++) {
     const id = `demoBabyPoi${String(i).padStart(3, "0")}`;
+    const name = DEMO_POI_NAME_POOL[i % DEMO_POI_NAME_POOL.length]!;
     pois.push({
       id,
-      name: `데모 맛집 ${i + 1}`,
-      address: `서울 데모로 ${i + 1} (실험용 데이터)`,
+      name,
+      address: `서울 종로구 샘플로 ${i + 1}길 ${10 + i}`,
       lat: baseLat + (i % 10) * 0.002,
       lng: baseLng + Math.floor(i / 10) * 0.002,
       category: "음식점",
@@ -233,7 +277,7 @@ export const demoBabyAiRoutes: FastifyPluginAsync = async (app) => {
       await prisma.cluster.delete({ where: { id: DEMO_BABY_AI_CLUSTER_ID } });
     }
 
-    const pois = buildDemoPois(50);
+    const pois = buildDemoPois(DEMO_BABY_AI_NOTE_LIMIT);
     const mapCenter = { lat: 37.5665, lng: 126.978 };
     const userName = user.name ?? user.email ?? "User";
 
@@ -248,17 +292,15 @@ export const demoBabyAiRoutes: FastifyPluginAsync = async (app) => {
     for (let poiIdx = 0; poiIdx < pois.length; poiIdx++) {
       const p = pois[poiIdx]!;
       const used = new Set<string>();
-      for (let j = 0; j < topics.length; j++) {
-        const topic = topics[(poiIdx + j) % topics.length]!;
-        const text = pickUniqueNoteText(p, poiIdx, j, topic, varyCommentsPerPoi, used);
-        noteRows.push({
-          clusterId: DEMO_BABY_AI_CLUSTER_ID,
-          poiId: p.id,
-          userId: user.id,
-          userName,
-          text,
-        });
-      }
+      const topic = topics[poiIdx % topics.length]!;
+      const text = pickUniqueNoteText(p, poiIdx, 0, topic, varyCommentsPerPoi, used);
+      noteRows.push({
+        clusterId: DEMO_BABY_AI_CLUSTER_ID,
+        poiId: p.id,
+        userId: user.id,
+        userName,
+        text,
+      });
     }
 
     await prisma.$transaction([
@@ -275,6 +317,8 @@ export const demoBabyAiRoutes: FastifyPluginAsync = async (app) => {
       prisma.clusterNote.createMany({ data: noteRows }),
     ]);
 
+    const interestNouns = await rebuildUserInterestNounsFromCorpus(user.id);
+
     const first = pois[0]!;
     const firstPoiNotes = noteRows.filter((n) => n.poiId === first.id).map((n) => n.text);
     const allTextsInOrder = noteRows.map((n) => n.text);
@@ -287,6 +331,7 @@ export const demoBabyAiRoutes: FastifyPluginAsync = async (app) => {
       notesCreated: noteRows.length,
       samplePoi: first,
       sampleUserComments,
+      interestNouns,
     };
     return body;
   });

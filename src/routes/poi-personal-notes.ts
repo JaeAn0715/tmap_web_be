@@ -9,6 +9,7 @@ import {
   imageUrlsFromDb,
 } from "../schemas/cluster-notes.js";
 import { personalPoiNoteToOut } from "../services/cluster-payload.js";
+import { ingestReviewTextForInterestNouns } from "../services/user-interest-nouns.js";
 
 const listQuerySchema = z.object({
   poiId: z.string().min(1).max(512).optional(),
@@ -66,6 +67,8 @@ export const poiPersonalNotesRoutes: FastifyPluginAsync = async (app) => {
         ...(urls.length > 0 ? { imageUrls: urls as Prisma.InputJsonValue } : {}),
       },
     });
+
+    await ingestReviewTextForInterestNouns(user.id, parsed.data.text);
 
     return personalPoiNoteToOut(row);
   });

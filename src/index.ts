@@ -10,6 +10,27 @@ async function main() {
   const { buildApp } = await import("./app.js");
 
   const cfg = loadConfig();
+  if (!cfg.usePglite) {
+    const { prisma } = await import("./lib/prisma.js");
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        [
+          "[startup] PostgreSQL에 연결할 수 없습니다.",
+          msg,
+          "",
+          "로컬에서 `npm run dev`를 쓰는 경우:",
+          "  1) Docker Desktop 실행 후 `npm run docker:up`",
+          "  2) `npx prisma migrate deploy`",
+          "Docker 없이 빠르게: `npm run dev:pglite`",
+        ].join("\n"),
+      );
+      process.exit(1);
+    }
+  }
+
   const app = await buildApp({
     jwtSecret: cfg.jwtSecret,
     googleClientId: cfg.googleClientId,

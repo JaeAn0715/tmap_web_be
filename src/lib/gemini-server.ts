@@ -25,11 +25,59 @@ export type PoiReviewSummaryPipelineLog = Pick<FastifyBaseLogger, "info">;
 type GeminiResp = {
   candidates?: Array<{
     content?: { parts?: Array<{ text?: string }> };
+    finishReason?: string;
     groundingMetadata?: { groundingChunks?: Array<{ web?: { uri?: string } }> };
   }>;
   promptFeedback?: { blockReason?: string };
   error?: { message?: string };
 };
+
+function extractCandidateText(json: GeminiResp): string {
+  const parts = json.candidates?.[0]?.content?.parts ?? [];
+  return parts
+    .map((p) => p.text ?? "")
+    .join("")
+    .trim();
+}
+
+/** Strip markdown fences / prose wrapper and return JSON object substring. */
+export function extractJsonObjectFromText(text: string): string {
+  let t = text.trim();
+  const fenced = t.match(/^```(?:json)?\s*([\s\S]*?)```\s*$/i);
+  if (fenced) t = fenced[1].trim();
+  if (t.startsWith("{")) return t;
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start >= 0 && end > start) return t.slice(start, end + 1);
+  return t;
+}
+
+export class GeminiJsonParseError extends Error {
+  readonly rawPreview: string;
+
+  constructor(rawPreview: string) {
+    super("Gemini JSON parse failed");
+    this.name = "GeminiJsonParseError";
+    this.rawPreview = rawPreview;
+  }
+}
+
+export function parseGeminiJsonText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) throw new GeminiJsonParseError("");
+  const attempts = [trimmed, extractJsonObjectFromText(trimmed)];
+  const seen = new Set<string>();
+  for (const candidate of attempts) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch {
+      /* try next */
+    }
+  }
+  throw new GeminiJsonParseError(trimmed.slice(0, 240));
+}
 
 function endpoint(model: string, key: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
@@ -48,7 +96,7 @@ export function poiContextLines(poi: PoiInput): string {
     .join("\n");
 }
 
-async function callGeminiGenerate(
+async function callGeminiGenerateOnce(
   apiKey: string,
   model: string,
   body: Record<string, unknown>,
@@ -60,14 +108,77 @@ async function callGeminiGenerate(
   });
   const json = (await res.json()) as GeminiResp;
   if (!res.ok) {
-    throw new Error(`Gemini ${res.status}: ${json.error?.message ?? res.statusText}`);
+    throw new GeminiHttpError(res.status, json.error?.message ?? res.statusText);
   }
   if (json.promptFeedback?.blockReason) {
     throw new Error(`Gemini blocked: ${json.promptFeedback.blockReason}`);
   }
-  const text = json.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const text = extractCandidateText(json);
   if (!text) throw new Error("Gemini empty response");
+  const finishReason = json.candidates?.[0]?.finishReason;
+  if (finishReason === "MAX_TOKENS") {
+    throw new GeminiJsonParseError(text.slice(0, 240));
+  }
   return text;
+}
+
+/** Gemini HTTP 5xx — 동일 모델 1회 재시도 대상. */
+export class GeminiHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(`Gemini ${status}: ${message}`);
+    this.name = "GeminiHttpError";
+    this.status = status;
+  }
+}
+
+type CallGeminiGenerateOptions = {
+  log?: PoiReviewSummaryPipelineLog;
+  /** true면 JSON 파싱까지 성공해야 반환 (POI 요약용). */
+  requireJson?: boolean;
+};
+
+const GEMINI_5XX_MAX_ATTEMPTS = 2;
+
+function shouldRetryGemini5xx(err: unknown): boolean {
+  return err instanceof GeminiHttpError && err.status >= 500;
+}
+
+async function callGeminiGenerate(
+  apiKey: string,
+  model: string,
+  body: Record<string, unknown>,
+  opts?: CallGeminiGenerateOptions,
+): Promise<string> {
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= GEMINI_5XX_MAX_ATTEMPTS; attempt++) {
+    try {
+      const text = await callGeminiGenerateOnce(apiKey, model, body);
+      if (opts?.requireJson) {
+        parseGeminiJsonText(text);
+      }
+      return text;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < GEMINI_5XX_MAX_ATTEMPTS && shouldRetryGemini5xx(e)) {
+        opts?.log?.info(
+          {
+            model,
+            attempt,
+            geminiStatus: e instanceof GeminiHttpError ? e.status : undefined,
+            reason: e instanceof Error ? e.message : String(e),
+          },
+          "gemini_retry",
+        );
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error("Gemini request failed");
 }
 
 function stripMarkdownLite(s: string): string {
@@ -200,186 +311,6 @@ function slidingWindowSubstrings(body: string, seen: Set<string>, need: number):
   return out;
 }
 
-const STOPWORDS_KO = new Set([
-  "있음",
-  "없음",
-  "그냥",
-  "진짜",
-  "좀",
-  "너무",
-  "정말",
-  "하는",
-  "되는",
-  "같은",
-  "이런",
-  "그런",
-  "있는",
-  "없는",
-  "하는데",
-  "입니다",
-  "했음",
-  "같음",
-]);
-
-/** Heuristic: exclude tokens unlikely to be bare nouns (step-1 fallback only). */
-function isLikelyNonNounKoToken(w: string): boolean {
-  if (STOPWORDS_KO.has(w)) return true;
-  if (/(해요|했어|습니다|ㅂ니다|었어요|아요|었음|였음|겠습니다|네요|죠)$/.test(w)) return true;
-  if (/(하는|되는|있는|없는|같은|싶은|좋은|나쁜|많은|적은)$/.test(w)) return true;
-  if (/(해서|하지만|려고|으면|는데|대서)$/.test(w)) return true;
-  if (/다$/.test(w) && w.length <= 4) return true;
-  return false;
-}
-
-/** Step-1 fallback: word frequency; noun-like tokens only (heuristic, no POS tagger). */
-function fallbackFrequentTermsFromComments(comments: string[], max: number): string[] {
-  const counts = new Map<string, number>();
-  if (typeof Intl === "undefined" || !("Segmenter" in Intl)) return [];
-  try {
-    const seg = new Intl.Segmenter("ko", { granularity: "word" });
-    for (const line of comments) {
-      for (const { segment, isWordLike } of seg.segment(line)) {
-        if (!isWordLike) continue;
-        const w = segment.trim();
-        if (w.length < 2 || w.length > 16) continue;
-        if (isLikelyNonNounKoToken(w)) continue;
-        counts.set(w, (counts.get(w) ?? 0) + 1);
-      }
-    }
-  } catch {
-    return [];
-  }
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, max)
-    .map(([w]) => w);
-}
-
-const keywordExtractSchema = {
-  type: "OBJECT",
-  properties: {
-    terms: {
-      type: "ARRAY",
-      items: { type: "STRING" },
-      minItems: 0,
-      maxItems: 24,
-    },
-  },
-  required: ["terms"],
-} as const;
-
-const reviewAnglesSchema = {
-  type: "OBJECT",
-  properties: {
-    angles: {
-      type: "ARRAY",
-      items: { type: "STRING" },
-      minItems: 1,
-      maxItems: 8,
-    },
-  },
-  required: ["angles"],
-} as const;
-
-type InterestCorpusMode = "all_user_reviews" | "search_hints_only";
-
-async function geminiExtractInterestNounsFromCorpus(
-  lines: string[],
-  mode: InterestCorpusMode,
-  apiKey: string,
-  model: string,
-): Promise<string[]> {
-  const block = lines.map((c, i) => `${i + 1}. ${c}`).join("\n");
-  const prompt =
-    mode === "all_user_reviews"
-      ? `역할: 사용자 취향 요약. 아래는 **동일 사용자**가 여러 장소에 남긴 **리뷰·노트 전체**(즐겨찾기 모음 공유 노트 + 개인 POI 메모 등)이다.
-
-목표:
-- 이 사람이 **목적지를 검색·선택할 때 중요하게 여길 만한 관심사**를 **명사·명사구**로만 정리하라.
-  - **포함**: 일반명사, 고유명사, 복합명사(예: 유모차, 아기의자, 웨이팅, 주차).
-  - **제외**: 동사·형용사·부사 단독, 활용형(했다, 좋아요 …), 관형사형(좋은, 많은 …), 감탄·무의미어.
-- 반복·강조된 관심을 우선. **최대 20개**, 2~12자 위주, 중요도·반복도 높은 순.
-- terms에는 **노트 원문 문장을 그대로 넣지 말 것**. 주제를 대표하는 **짧은 명사·명사구**만.
-
-리뷰·노트:
-${block}
-
-출력: JSON만 { "terms": string[] } — **명사·명사구만**.`
-      : `아래는 저장된 사용자 리뷰가 없을 때 쓰는 **검색·의도 힌트** 목록뿐이다. 이 힌트만으로 이 사용자가 장소를 고를 때 중요하게 볼 만한 관심을 **명사·명사구**로 추출하라. (최대 20개, 2~12자 위주)
-
-힌트:
-${block}
-
-출력: JSON만 { "terms": string[] } — **명사·명사구만**.`;
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.25,
-      maxOutputTokens: 400,
-      responseMimeType: "application/json",
-      responseSchema: keywordExtractSchema,
-    },
-  };
-  const text = await callGeminiGenerate(apiKey, model, body);
-  let raw: { terms?: string[] };
-  try {
-    raw = JSON.parse(text) as typeof raw;
-  } catch {
-    return [];
-  }
-  const terms = (raw.terms ?? [])
-    .map((t) => String(t).trim())
-    .filter((t) => t.length >= 2 && t.length <= 16);
-  return [...new Set(terms)].slice(0, 20);
-}
-
-async function geminiBuildReviewAngles(
-  terms: string[],
-  hints: string[],
-  apiKey: string,
-  model: string,
-): Promise<string[]> {
-  const termsLine = terms.length
-    ? terms.join(", ")
-    : "(전역 리뷰·노트에서 뽑은 관심 명사 없음 — 힌트·일반만 사용)";
-  const hintsLine = hints.length ? hints.map((h, i) => `${i + 1}. ${h}`).join("\n") : "(검색·의도 힌트 없음)";
-
-  const prompt = `아래는 한 사용자의 **관심 명사 키워드**(**여러 장소에 남긴 리뷰·노트 전체**에서 요약한 **명사·명사구**)와 **최근 검색·의도 힌트**이다.
-
-이런 관심을 가진 사람이 장소(음식점·카페·키즈 등) 리뷰를 볼 때 **특히 확인하고 싶어 할 관점**을 3~7개 bullet로 짧은 한국어 구로 제시하라. (예: 유모차 동선, 아기의자 수, 웨이팅, 주차, 소음, 위생 등 — 입력에 맞게 가변)
-각 문장은 **일반 방문자에게 쓰는 조언 톤**으로, 사용자 원문 표현을 인용하지 말 것.
-
-[키워드]
-${termsLine}
-
-[힌트]
-${hintsLine}
-
-출력: JSON만 { "angles": string[] } — 각 원소는 8~60자 정도의 구체적 관점 한 줄.`;
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.35,
-      maxOutputTokens: 500,
-      responseMimeType: "application/json",
-      responseSchema: reviewAnglesSchema,
-    },
-  };
-  const text = await callGeminiGenerate(apiKey, model, body);
-  let raw: { angles?: string[] };
-  try {
-    raw = JSON.parse(text) as typeof raw;
-  } catch {
-    return [];
-  }
-  return (raw.angles ?? [])
-    .map((a) => String(a).trim())
-    .filter(Boolean)
-    .slice(0, 8);
-}
-
 function ensureHighlightTerms(rawTerms: string[], pros: string, cons: string): string[] {
   const body = pros + cons;
   let terms = filterHighlightsInBody(rawTerms, pros, cons);
@@ -409,81 +340,31 @@ function ensureHighlightTerms(rawTerms: string[], pros: string, cons: string): s
 }
 
 /**
- * POI 상세용: 3단계 파이프라인
- * 1) **전역** 리뷰·노트 코퍼스에서 관심 **명사** 추출(없으면 검색 힌트만으로 추출) → 2) 리뷰 관점 → 3) pros/cons/highlightTerms.
- * `userComments`는 **현재 POI** 노트 원문으로, 모델이 **어느 관점을 중시할지** 추론할 때만 쓰인다. **최종 요약에는 노트 내용을 넣지 않는다**(프롬프트로 강제).
- * `globalUserReviewCorpus`는 1단계 전역 관심 추출용.
- * `log`가 있으면 각 단계 결과를 `info`로 남긴다(터미널).
+ * POI 상세용: 저장된 관심 명사(최대 10)를 반영한 단일 Gemini 호출.
+ * `storedInterestNouns`는 리뷰 등록 시 서버가 미리 추출·저장한 목록이다(AI 요약과 분리).
+ * `userComments`는 **현재 POI** 노트 원문으로, 모델이 **어느 관점을 중시할지** 추론할 때만 쓰인다.
  */
 export async function geminiPoiReviewSummaryServer(
   poi: PoiInput,
   userComments: string[],
-  globalUserReviewCorpus: string[],
+  storedInterestNouns: string[],
   interestHints: string[],
   apiKey: string,
   model: string,
   log?: PoiReviewSummaryPipelineLog,
 ): Promise<PoiReviewSummaryResult> {
   const comments = userComments.map(sanitizeCommentLine).filter((x): x is string => x != null);
-  const globalLines = globalUserReviewCorpus.map(sanitizeCommentLine).filter((x): x is string => x != null);
+  const nouns = storedInterestNouns.map((s) => s.trim()).filter(Boolean);
   const hints = interestHints.map((s) => s.trim()).filter(Boolean);
 
-  let step1Terms: string[] = [];
-  let step1Source: "global_corpus" | "search_hints" | "none" = "none";
-  if (globalLines.length > 0) {
-    step1Source = "global_corpus";
-    try {
-      step1Terms = await geminiExtractInterestNounsFromCorpus(globalLines, "all_user_reviews", apiKey, model);
-    } catch {
-      step1Terms = [];
-    }
-    if (step1Terms.length === 0) {
-      step1Terms = fallbackFrequentTermsFromComments(globalLines, 20);
-    }
-  } else if (hints.length > 0) {
-    step1Source = "search_hints";
-    try {
-      step1Terms = await geminiExtractInterestNounsFromCorpus(hints, "search_hints_only", apiKey, model);
-    } catch {
-      step1Terms = [];
-    }
-    if (step1Terms.length === 0) {
-      step1Terms = fallbackFrequentTermsFromComments(hints, 20);
-    }
-  }
   log?.info(
     {
       step: 1,
-      phase: "global_interest_nouns",
+      phase: "review_summary_input",
       poiId: poi.id,
-      step1Source,
-      terms: step1Terms,
-      globalCorpusLines: globalLines.length,
+      storedInterestNouns: nouns,
       poiLocalCommentLines: comments.length,
       hintCount: hints.length,
-    },
-    "poi_review_summary",
-  );
-
-  let step2Angles: string[] = [];
-  try {
-    step2Angles = await geminiBuildReviewAngles(step1Terms, hints, apiKey, model);
-  } catch {
-    step2Angles = [];
-  }
-  if (step2Angles.length === 0) {
-    step2Angles = [
-      hints.length > 0
-        ? `최근 검색·의도 힌트를 반영한 방문 관점에서 장단점을 쓴다. 힌트: ${hints.slice(0, 8).join(", ")}`
-        : "일반 방문자 관점에서 동선·대기·가격대·청결·재방문 의사 등 균형 있게 장단점을 쓴다.",
-    ];
-  }
-  log?.info(
-    {
-      step: 2,
-      phase: "review_angles",
-      poiId: poi.id,
-      angles: step2Angles,
     },
     "poi_review_summary",
   );
@@ -494,25 +375,36 @@ export async function geminiPoiReviewSummaryServer(
           .map((c, i) => `${i + 1}. ${c}`)
           .join("\n") +
           "\n\n(위 블록은 **내부 신호**다. 아래 최종 출력 규칙을 따른다.)"
-      : "(이 POI에 대한 사용자 노트 원문 없음 — [전역 관심 키워드]·[리뷰 관점]·POI 메타·일반 방문자 상식만으로 서술한다.)";
+      : "(이 POI에 대한 사용자 노트 원문 없음 — [저장된 관심 명사]·POI 메타·일반 방문자 상식만으로 서술한다.)";
 
-  const anglesBlock = step2Angles.map((a, i) => `${i + 1}. ${a}`).join("\n");
+  const nounsBlock =
+    nouns.length > 0
+      ? nouns.join(", ")
+      : hints.length > 0
+        ? `(저장된 관심 명사 없음 — 검색·의도 힌트 참고: ${hints.join(", ")})`
+        : "(없음 — 일반 방문자 관점으로 균형 있게 서술)";
+
+  const nounPriorityRule =
+    nouns.length > 0
+      ? `- **[저장된 관심 명사]** 중 이 POI 업종·메타와 **관련 있는 주제**가 있으면 pros/cons **앞쪽에서** 다룬다. 관련 주제가 없으면 일반 방문자 관점의 균형 잡힌 요약을 쓴다.`
+      : hints.length > 0
+        ? `- 저장된 관심 명사가 없으므로 [검색·의도 힌트]와 POI 메타를 참고해 일반 방문자 관점으로 서술한다.`
+        : `- 저장된 관심 명사가 없으므로 일반 방문자 관점에서 동선·대기·가격·청결 등 균형 있게 서술한다.`;
 
   const prompt = `당신은 한국 장소(POI)에 대한 **리뷰 성격의 장단점 요약**을 작성한다. 최종 JSON의 pros·cons·highlightTerms는 **앱에 노출되는 사용자 대면 문구**이며, 사용자가 과거에 적어 둔 **노트·코멘트 원문이 그대로 또는 간접적으로 드러나서는 안 된다**.
 
 역할 분리:
-- **[전역 관심 키워드]**: 이 사용자가 **여러 장소에 남긴 기록 전체**에서 추정한 **명사·명사구** 수준의 관심사. 장소를 고를 때 무엇을 중시하는지의 힌트. **모든 POI 요약에 공통 적용**.
-- **[이 POI 비공개 노트 원문]**: **오직 내부용**. 이 사람이 **이 장소**에 대해 무엇을 중요하게 보는지(우선순위·관심 축)를 **추론**하는 데만 쓴다. **요약 본문의 근거 문장·인용·패러프레이즈·1인칭·노트에만 나오는 구체 표현으로 되살리지 말 것.** 노트를 "요약의 재료"로 쓰지 말고, **일반 방문자에게 줄 조언**만 쓴다.
-- **[리뷰 관점]**: 위 신호와 힌트를 바탕으로 **어떤 각도를 볼지** 정한 목록. pros/cons는 이 관점의 **일반화된 서술**로 채운다.
+- **[저장된 관심 명사]**: 이 사용자가 **여러 리뷰·노트에서 자주 쓴 명사** 목록(최대 10). 장소를 고를 때 무엇을 중시하는지의 힌트.
+- **[이 POI 비공개 노트 원문]**: **오직 내부용**. 이 사람이 **이 장소**에 대해 무엇을 중요하게 보는지(우선순위·관심 축)를 **추론**하는 데만 쓴다. **요약 본문의 근거 문장·인용·패러프레이즈·1인칭·노트에만 나오는 구체 표현으로 되살리지 말 것.**
 - **[POI]**: 공개 메타(이름·주소·업종 등)만 **사실의 기준**으로 삼을 수 있다. 메타에 없는 구체 사실은 노트 내용을 빌려와 단정하지 말고, **업종·일반 상식** 수준으로만 말한다.
 
 작성 규칙:
+${nounPriorityRule}
 - pros/cons는 **화자 없는 제3자/일반 방문자 톤**이다. "내가 썼다", "노트에", "메모대로" 등 **사용자 기록을 언급하거나 암시하지 말 것**.
-- **[이 POI 비공개 노트 원문]**에서 단어·구절을 **복사하거나 살짝 바꿔 붙이지 말 것**(표절·유사 인용 금지). 노트가 특정 주제를 중시함을 알았다면, 그 주제는 **[전역 관심 키워드]·[리뷰 관점]·POI 메타**만으로 **새 문장**을 지어 다룬다.
-- **[전역 관심 키워드]**와 맞닿는 주제가 있으면 **앞쪽에서 다룰 우선순위**로 삼을 수 있으나, 내용은 항상 **일반적·보편적 서술**로 유지한다.
+- **[이 POI 비공개 노트 원문]**에서 단어·구절을 **복사하거나 살짝 바꿔 붙이지 말 것**(표절·유사 인용 금지).
 - **이 POI**에 대해 메타·일반 상식으로도 말할 수 없는 세부는 **단정하지 않는다**.
 - 웹 검색 도구는 사용하지 않는다.
-- **괄호 부연·메타 설명 금지**(반각·전각). "제공된 정보", "입력으로는", "이 부분은 … 정보가" 같은 **데이터·프롬프트 메타 코멘트 금지**.
+- **괄호 부연·메타 설명 금지**(반각·전각). "제공된 정보", "입력으로는" 같은 **데이터·프롬프트 메타 코멘트 금지**.
 
 [POI]
 ${poiContextLines(poi)}
@@ -521,16 +413,13 @@ ${poiContextLines(poi)}
 [이 POI 비공개 노트 원문 — 사용자에게 비노출. 관점 추론 전용; pros/cons에 반영·인용 금지]
 ${commentsBlock}
 
-[전역 관심 키워드 — 1단계, 모든 POI에 공통 적용되는 명사·명사구]
-${step1Terms.length ? step1Terms.join(", ") : "(없음 — 힌트·업종 일반만 사용)"}
-
-[리뷰 관점 — 2단계]
-${anglesBlock}
+[저장된 관심 명사 — 리뷰 등록 시 서버가 미리 추출·저장]
+${nounsBlock}
 
 출력 (JSON만, 마크다운 없음):
 - pros: 한국어 평문, ${REVIEW_PROS_CONS_MAX}자 이하, 장점·긍정 요약. **노트 원문과 겹치는 표현 없음.** 마크다운 볼드 금지. **괄호 부연·메타 문구 없음.**
 - cons: 한국어 평문, ${REVIEW_PROS_CONS_MAX}자 이하, 단점·유의사항. 동일.
-- highlightTerms: ${HL_MIN}~${HL_MAX}개. 각 ${HL_TERM_MIN}~${HL_TERM_MAX}자. **반드시 pros 또는 cons에 부분 문자열로 포함**될 것. **노트에만 있던 짧은 구절·고유 표현과 동일·유사한 항목은 넣지 말 것** — pros/cons 안에서 새로 쓴 일반 문장 조각만 고른다. 가능하면 [전역 관심 키워드]와 맞닿는 일반 표현을 우선한다.
+- highlightTerms: ${HL_MIN}~${HL_MAX}개. 각 ${HL_TERM_MIN}~${HL_TERM_MAX}자. **반드시 pros 또는 cons에 부분 문자열로 포함**될 것. **노트에만 있던 짧은 구절·고유 표현과 동일·유사한 항목은 넣지 말 것** — pros/cons 안에서 새로 쓴 일반 문장 조각만 고른다. 가능하면 [저장된 관심 명사]와 맞닿는 일반 표현을 우선한다.
 
 규칙:
 - **자기(이 사용자) 노트를 요약에 끌어다 쓰는 것 금지.**`;
@@ -558,13 +447,15 @@ ${anglesBlock}
     },
   };
 
-  const text = await callGeminiGenerate(apiKey, model, body);
-  let raw: { pros?: string; cons?: string; highlightTerms?: string[] };
-  try {
-    raw = JSON.parse(text) as typeof raw;
-  } catch {
-    throw new Error("Gemini JSON parse failed");
-  }
+  const text = await callGeminiGenerate(apiKey, model, body, {
+    log,
+    requireJson: true,
+  });
+  const raw = parseGeminiJsonText(text) as {
+    pros?: string;
+    cons?: string;
+    highlightTerms?: string[];
+  };
 
   const pros = polishReviewSummarySentence(String(raw.pros ?? "")).slice(0, REVIEW_PROS_CONS_MAX);
   const cons = polishReviewSummarySentence(String(raw.cons ?? "")).slice(0, REVIEW_PROS_CONS_MAX);
@@ -578,7 +469,7 @@ ${anglesBlock}
 
   log?.info(
     {
-      step: 3,
+      step: 2,
       phase: "review_result",
       poiId: poi.id,
       pros: checked.data.pros,
@@ -655,4 +546,14 @@ Output rules:
     }
   }
   return null;
+}
+
+/** @internal unit tests only */
+export async function callGeminiGenerateForTest(
+  apiKey: string,
+  model: string,
+  body: Record<string, unknown>,
+  requireJson = false,
+): Promise<string> {
+  return callGeminiGenerate(apiKey, model, body, { requireJson });
 }

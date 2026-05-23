@@ -3,7 +3,7 @@ import { z } from "zod";
 import { requireUser } from "../plugins/auth.js";
 import { poiSchema } from "../schemas/poi.js";
 import { geminiPoiReviewSummaryServer } from "../lib/gemini-server.js";
-import { loadGlobalUserReviewCorpus } from "../services/user-interest-corpus.js";
+import { loadUserTopInterestNouns } from "../services/user-interest-nouns.js";
 
 const bodyPoi = z.object({ poi: poiSchema });
 const noteSnippet = z.string().max(4000);
@@ -36,13 +36,13 @@ export const aiRoutes: FastifyPluginAsync<AiRoutesOptions> = async (app, opts) =
       return reply.code(400).send({ error: "Invalid body", details: parsed.error.flatten() });
     }
     try {
-      const globalCorpus = request.user
-        ? await loadGlobalUserReviewCorpus(request.user.id)
+      const storedNouns = request.user
+        ? await loadUserTopInterestNouns(request.user.id)
         : [];
       return await geminiPoiReviewSummaryServer(
         parsed.data.poi,
         parsed.data.userComments,
-        globalCorpus,
+        storedNouns,
         parsed.data.interestHints,
         opts.geminiApiKey,
         opts.geminiModel,

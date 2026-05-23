@@ -13,6 +13,7 @@ import {
   buildNotePatchSchema,
   imageUrlsFromDb,
 } from "../schemas/cluster-notes.js";
+import { ingestReviewTextForInterestNouns } from "../services/user-interest-nouns.js";
 
 export const clusterRoutes: FastifyPluginAsync = async (app) => {
   app.get("/clusters/:id", async (request, reply) => {
@@ -332,6 +333,7 @@ export const clusterRoutes: FastifyPluginAsync = async (app) => {
         ...(urls.length > 0 ? { imageUrls: urls as Prisma.InputJsonValue } : {}),
       },
     });
+    await ingestReviewTextForInterestNouns(user.id, parsed.data.text);
     await touchClusterUpdatedAt(clusterId);
 
     return buildClusterPayload(
